@@ -40,6 +40,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "Preferences.h"
 #include "Projectile.h"
 #include "Random.h"
+#include "ship/NewtonianFlight.h"
 #include "ship/ResourceLevels.h"
 #include "ShipEvent.h"
 #include "audio/Sound.h"
@@ -67,6 +68,60 @@ namespace {
 
 	const vector<string> ENGINE_SIDE = {"under", "over"};
 	const vector<string> STEERING_FACING = {"none", "left", "right"};
+
+	// Newtonian flight proof of concept tuning, read from the gamerules.
+	// Gamerule misc values are integers, so fractions are stored as percentages.
+	struct NewtonianTuning {
+		// Assist off: thrust effectiveness is down to 10% at this multiple of rated speed.
+		double softCap = 2.5;
+		// Frames to spin up from rest to the rated turn rate.
+		double spinUpFrames = 10.;
+		// Built-in retro and lateral thrust, as a fraction of main thrust.
+		double baseline = .19;
+		// Multipliers on the energy and heat cost of every thruster (main, retro,
+		// lateral, turning and afterburner).
+		double energyCost = 4.;
+		double heatCost = 2.;
+		// Multiplier on energy regeneration (generation, solar and fuel energy).
+		double energyRegen = .75;
+		// Fraction of a Newtonian ship's velocity its projectiles inherit (A5.8).
+		double projectileInheritance = 1.;
+	};
+
+	NewtonianTuning GetNewtonianTuning()
+	{
+		const Gamerules &rules = GameData::GetGamerules();
+		NewtonianTuning tuning;
+		int value = rules.GetValue("newtonian soft cap percent");
+		if(value > 100)
+			tuning.softCap = value * .01;
+		value = rules.GetValue("newtonian spin up frames");
+		if(value > 0)
+			tuning.spinUpFrames = value;
+		value = rules.GetValue("newtonian baseline thrust percent");
+		if(value > 0)
+			tuning.baseline = value * .01;
+		value = rules.GetValue("newtonian thruster energy percent");
+		if(value > 0)
+			tuning.energyCost = value * .01;
+		value = rules.GetValue("newtonian thruster heat percent");
+		if(value > 0)
+			tuning.heatCost = value * .01;
+		value = rules.GetValue("newtonian energy regen percent");
+		if(value > 0)
+			tuning.energyRegen = value * .01;
+		value = rules.GetValue("newtonian projectile inheritance percent");
+		if(value > 0)
+			tuning.projectileInheritance = value * .01;
+		return tuning;
+	}
+
+	// Heavier ships take longer to spin up to their rated turn rate (A2): the spin up
+	// gamerule applies to a ship of this inertial mass, scaled by the square root of
+	// the mass ratio and clamped to this range.
+	constexpr double SPIN_UP_REFERENCE_MASS = 300.;
+	constexpr double SPIN_UP_MIN_SCALE = .5;
+	constexpr double SPIN_UP_MAX_SCALE = 3.;
 
 	// Scanning takes up to 10 seconds (SCAN_TIME / MIN_SCAN_STEPS)
 	// dependent on the range from the ship (among other factors).
@@ -174,8 +229,14 @@ namespace {
 		const vector<pair<Drawable, int>> &flareSprites, uint8_t side, bool reverse)
 	{
 		Point thrustScale = ScaledFlareCurve(ship, reverse ? Ship::ThrustKind::REVERSE : Ship::ThrustKind::FORWARD);
-		Point leftTurnScale = ScaledFlareCurve(ship, Ship::ThrustKind::LEFT);
-		Point rightTurnScale = ScaledFlareCurve(ship, Ship::ThrustKind::RIGHT);
+		// Steering flares also show for the lateral thrusters (A3), whichever is stronger.
+		auto steeringScale = [&ship](Ship::ThrustKind turn, Ship::ThrustKind lateral)
+		{
+			return ScaledFlareCurve(ship,
+				ship.ThrustHeldFrames(turn) >= ship.ThrustHeldFrames(lateral) ? turn : lateral);
+		};
+		Point leftTurnScale = steeringScale(Ship::ThrustKind::LEFT, Ship::ThrustKind::LATERAL_LEFT);
+		Point rightTurnScale = steeringScale(Ship::ThrustKind::RIGHT, Ship::ThrustKind::LATERAL_RIGHT);
 
 		double gimbalDirection = (ship.Commands().Has(Command::FORWARD) || ship.Commands().Has(Command::BACK))
 			* -ship.Commands().Turn();
@@ -530,6 +591,8 @@ void Ship::Load(const DataNode &node, const ConditionsStore *playerConditions)
 			noun = child.Token(1);
 		else if(key == "swizzle" && hasValue)
 			customSwizzle = GameData::Swizzles().Get(child.Token(1));
+		else if(key == "flight assist off")
+			flightAssist = false;
 		else if(key == "uuid" && hasValue)
 			uuid = EsUuid::FromString(child.Token(1));
 		else if(key == "administrative cost" && hasValue)
@@ -1274,6 +1337,8 @@ void Ship::Save(DataWriter &out) const
 			out.Write("uncapturable");
 		if(customSwizzle)
 			out.Write("swizzle", customSwizzle->TrueName());
+		if(!flightAssist)
+			out.Write("flight assist off");
 		if(administrativeCost.has_value())
 			out.Write("administrative cost", administrativeCost.value());
 
@@ -1755,6 +1820,7 @@ void Ship::Place(Point position, Point velocity, Angle angle, bool isDeparting)
 	this->velocity = velocity;
 	this->angle = Angle();
 	Turn(angle);
+	angularVelocity = 0.;
 
 	// If landed, place the ship right above the planet.
 	// Escorts should take off a bit behind their flagships.
@@ -2220,7 +2286,9 @@ void Ship::Draw(DrawList &draw, optional<reference_wrapper<vector<Visual>>> visu
 		else if(ThrustHeldFrames(Ship::ThrustKind::REVERSE) && !ReverseEnginePoints().empty())
 			DrawFlareSprites(*this, draw, ReverseEnginePoints(),
 				Attributes().ReverseFlareSprites(), where, true);
-		if((ThrustHeldFrames(Ship::ThrustKind::LEFT) || ThrustHeldFrames(Ship::ThrustKind::RIGHT))
+		if((ThrustHeldFrames(Ship::ThrustKind::LEFT) || ThrustHeldFrames(Ship::ThrustKind::RIGHT)
+				|| ThrustHeldFrames(Ship::ThrustKind::LATERAL_LEFT)
+				|| ThrustHeldFrames(Ship::ThrustKind::LATERAL_RIGHT))
 			&& !SteeringEnginePoints().empty())
 			DrawFlareSprites(*this, draw, SteeringEnginePoints(),
 				Attributes().SteeringFlareSprites(), where, false);
@@ -3769,6 +3837,122 @@ double Ship::CrewTurnRate() const
 
 
 
+void Ship::SetNewtonian(bool value)
+{
+	if(isNewtonian == value)
+		return;
+	isNewtonian = value;
+	angularVelocity = 0.;
+}
+
+
+
+bool Ship::IsNewtonian() const
+{
+	return isNewtonian;
+}
+
+
+
+void Ship::ToggleFlightAssist()
+{
+	flightAssist = !flightAssist;
+}
+
+
+
+void Ship::SetFlightAssist(bool value)
+{
+	flightAssist = value;
+}
+
+
+
+bool Ship::FlightAssist() const
+{
+	return flightAssist && HasFlightComputer();
+}
+
+
+
+bool Ship::HasFlightComputer() const
+{
+	return Attributes().Get("flight computer") > 0.;
+}
+
+
+
+double Ship::ProjectileVelocityInheritance() const
+{
+	return isNewtonian ? GetNewtonianTuning().projectileInheritance : 1.;
+}
+
+
+
+void Ship::SetNewtonianAutopilot(bool value)
+{
+	newtonianAutopilot = value;
+}
+
+
+
+bool Ship::UsesNewtonianPhysics() const
+{
+	return isNewtonian && !newtonianAutopilot;
+}
+
+
+
+Ship::FlightAssistState Ship::GetFlightAssistState() const
+{
+	return flightAssistState;
+}
+
+
+
+double Ship::RatedSpeed() const
+{
+	return ratedSpeed ? ratedSpeed : MaxVelocity();
+}
+
+
+
+double Ship::NewtonianSoftCap() const
+{
+	return GetNewtonianTuning().softCap;
+}
+
+
+
+double Ship::AngularVelocity() const
+{
+	return angularVelocity;
+}
+
+
+
+double Ship::AngularAcceleration() const
+{
+	return TurnRate() / SpinUpFrames();
+}
+
+
+
+double Ship::SpinUpFrames() const
+{
+	double scale = sqrt(max(0., InertialMass()) / SPIN_UP_REFERENCE_MASS);
+	return GetNewtonianTuning().spinUpFrames * clamp(scale, SPIN_UP_MIN_SCALE, SPIN_UP_MAX_SCALE);
+}
+
+
+
+double Ship::NewtonianRetroAcceleration() const
+{
+	return ReverseAcceleration() + Acceleration() * GetNewtonianTuning().baseline;
+}
+
+
+
 double Ship::Acceleration() const
 {
 	double thrust = cache.thrust;
@@ -5133,6 +5317,8 @@ void Ship::DoGeneration()
 		PauseAnimation();
 	else
 	{
+		// Newtonian flight slows energy regeneration.
+		const double energyRegen = isNewtonian ? GetNewtonianTuning().energyRegen : 1.;
 		// Ramscoops work much better when close to the system center.
 		// Carried fighters can't collect fuel or energy this way.
 		if(currentSystem)
@@ -5140,12 +5326,12 @@ void Ship::DoGeneration()
 			System::SolarGeneration generation = currentSystem->GetSolarGeneration(position,
 				cache.ramscoop, cache.solarCollection, cache.solarHeat);
 			levels.fuel += generation.fuel;
-			levels.energy += generation.energy;
+			levels.energy += generation.energy * energyRegen;
 			levels.heat += generation.heat;
 		}
 
 		double coolingEfficiency = CoolingEfficiency();
-		levels.energy += cache.energyGeneration - cache.energyConsumption;
+		levels.energy += cache.energyGeneration * energyRegen - cache.energyConsumption;
 		levels.fuel += cache.fuelGeneration;
 		levels.heat += cache.heatGeneration - coolingEfficiency * cache.cooling;
 
@@ -5153,7 +5339,7 @@ void Ship::DoGeneration()
 		if(cache.fuelConsumption <= levels.fuel)
 		{
 			levels.fuel -= cache.fuelConsumption;
-			levels.energy += cache.fuelEnergy;
+			levels.energy += cache.fuelEnergy * energyRegen;
 			levels.heat += cache.fuelHeat;
 		}
 
@@ -5546,6 +5732,21 @@ void Ship::StepPilot()
 // disabled, all it can do is slow down to a stop.
 void Ship::DoMovement(bool &isUsingAfterburner)
 {
+	if(isNewtonian && !newtonianAutopilot)
+	{
+		DoNewtonianMovement(isUsingAfterburner);
+		return;
+	}
+	if(isNewtonian)
+	{
+		// An autopilot is flying with legacy physics. Keep the Newtonian state in
+		// step so that handing control back is seamless.
+		angularVelocity = 0.;
+		ratedSpeed = MaxVelocity(commands.Has(Command::AFTERBURNER));
+		flightAssistState = FlightAssist() ? FlightAssistState::ON
+			: HasFlightComputer() ? FlightAssistState::OFF : FlightAssistState::NO_COMPUTER;
+	}
+
 	isUsingAfterburner = false;
 
 	double mass = InertialMass();
@@ -5649,6 +5850,200 @@ void Ship::DoMovement(bool &isUsingAfterburner)
 		}
 		acceleration = Point();
 	}
+}
+
+
+
+// Newtonian flight proof of concept (plans/flight-simulation-A.md, A1-A3 and A5).
+// No drag: velocity persists until a thruster changes it. Turning has momentum.
+// Every hull gets baseline retro and lateral thrusters. With flight assist on,
+// the ship flies like the old drag model: speed is capped at the rated speed,
+// the ship slides when it turns, spins are stopped, and with no thrust input the
+// computer fires the weak manoeuvring thrusters to bring the ship to rest. With
+// assist off, each input is raw thrust or torque, with a soft cap above rated speed.
+void Ship::DoNewtonianMovement(bool &isUsingAfterburner)
+{
+	// No flight computer means no assist (A5.4).
+	const bool assist = FlightAssist();
+	isUsingAfterburner = false;
+	const NewtonianTuning tuning = GetNewtonianTuning();
+	const double slowMultiplier = 1. / (1. + levels.slowness * .05);
+	const Point facing = angle.Unit();
+	// Thrusters cost more energy and make more heat under Newtonian flight.
+	ResourceLevels turnCost = cache.turnCost;
+	ResourceLevels thrustCost = cache.thrustCost;
+	ResourceLevels afterburnerCost = cache.afterburnerThrustCost;
+	ResourceLevels reverseCost = cache.reverseThrustCost;
+	ResourceLevels lateralCost = cache.lateralThrustCost;
+	for(ResourceLevels *cost : {&turnCost, &thrustCost, &afterburnerCost, &reverseCost, &lateralCost})
+	{
+		cost->energy *= tuning.energyCost;
+		cost->heat *= tuning.heatCost;
+	}
+
+	// External forces (weapon hit force, collisions) still push the ship.
+	if(acceleration)
+	{
+		velocity += acceleration;
+		acceleration = Point();
+	}
+
+	// Emergency station-keeping for ships that can't act (A5.7).
+	if(isDisabled || NeedsEnergy())
+	{
+		velocity *= NewtonianFlight::STATION_KEEPING_DECAY;
+		angularVelocity *= NewtonianFlight::STATION_KEEPING_DECAY;
+		if(angularVelocity)
+			Turn(angularVelocity);
+		flightAssistState = assist ? FlightAssistState::LIMIT
+			: HasFlightComputer() ? FlightAssistState::OFF : FlightAssistState::NO_COMPUTER;
+		return;
+	}
+	// A pilot error means nobody is at the controls this frame: just coast.
+	if(pilotError)
+	{
+		if(angularVelocity)
+			Turn(angularVelocity);
+		return;
+	}
+
+	bool saturated = false;
+
+	// Rotation (A2).
+	const double ratedTurn = TurnRate() * slowMultiplier;
+	const double angularAccel = ratedTurn / SpinUpFrames();
+	const NewtonianFlight::RotationPlan rotation = NewtonianFlight::PlanRotation(
+		assist, commands.Turn(), angularVelocity, ratedTurn, angularAccel, tuning.softCap);
+	double deltaOmega = rotation.deltaOmega;
+	if(deltaOmega && angularAccel > 0.)
+	{
+		// Costs follow torque, not rotation: coasting in a spin is free.
+		double throttle = fabs(deltaOmega) / angularAccel;
+		double available = AvailableResources().FractionalUsage(turnCost);
+		if(throttle > available)
+		{
+			deltaOmega *= available / throttle;
+			throttle = available;
+			saturated = true;
+		}
+		levels.Damage(turnCost, throttle);
+		angularVelocity += deltaOmega * rotation.capFactor;
+		isSteering = true;
+		steeringDirection = (deltaOmega < 0.) ? -1. : 1.;
+		IncrementThrusterHeld(deltaOmega < 0. ? ThrustKind::LEFT : ThrustKind::RIGHT);
+	}
+	if(fabs(angularVelocity) < 1e-6)
+		angularVelocity = 0.;
+	if(angularVelocity)
+		Turn(angularVelocity);
+
+	// Translation (A1, A3).
+	const double mass = InertialMass();
+	const bool afterburnerHeld = commands.Has(Command::AFTERBURNER) && cache.afterburnerThrust
+		&& !CannotAct(Ship::ActionType::AFTERBURNER) && AvailableResources().CanExpend(afterburnerCost);
+	// A5.6: holding the afterburner raises the rated speed to the boosted speed.
+	ratedSpeed = MaxVelocity(afterburnerHeld);
+	const double forwardAccel = Acceleration() * slowMultiplier;
+	const double afterburnerAccel = afterburnerHeld
+		? cache.afterburnerThrust / mass * cache.accelerationMult * slowMultiplier : 0.;
+	// A3: manoeuvring thrust is the built-in baseline plus any reverse or lateral
+	// thruster outfits, which stack on top of it.
+	const double baselineAccel = forwardAccel * tuning.baseline;
+	const double reverseOutfitAccel = ReverseAcceleration() * slowMultiplier;
+	const double lateralOutfitAccel = cache.lateralThrust / mass * cache.accelerationMult * slowMultiplier;
+	const double retroAccel = baselineAccel + reverseOutfitAccel;
+	const double lateralAccel = baselineAccel + lateralOutfitAccel;
+
+	NewtonianFlight::Thrusters thrusters;
+	thrusters.forward = forwardAccel;
+	thrusters.afterburner = afterburnerAccel;
+	thrusters.retro = retroAccel;
+	thrusters.lateral = lateralAccel;
+	NewtonianFlight::Input input;
+	input.thrust = commands.Has(Command::FORWARD) - commands.Has(Command::BACK);
+	input.strafe = commands.Has(Command::STRAFE_RIGHT) - commands.Has(Command::STRAFE_LEFT);
+	input.afterburner = afterburnerHeld;
+	input.stop = commands.Has(Command::STOP);
+	const NewtonianFlight::TranslationPlan plan = NewtonianFlight::PlanTranslation(
+		assist, velocity, facing, ratedSpeed, thrusters, input, tuning.softCap);
+	double dvForward = plan.dvForward;
+	double dvLateral = plan.dvLateral;
+	const bool braking = plan.braking;
+	saturated |= plan.saturated;
+
+	// Split off the afterburner's share of forward thrust; it has its own cost.
+	double afterburnerPart = max(0., dvForward - forwardAccel);
+	double mainPart = dvForward - afterburnerPart;
+
+	// A5.2 / A3 costs: the main engine and the built-in baseline thrusters pay the
+	// main engine's cost per unit of delta-v. Reverse and lateral thruster outfits
+	// pay their own cost sets for their share of each burn: a group at full
+	// throttle burns the baseline and every outfit in it at full power.
+	// A5.3: drift cancel (lateral) is paid for before speed hold.
+	auto groupCost = [&](const ResourceLevels &outfitCost) -> ResourceLevels
+	{
+		return outfitCost + thrustCost * tuning.baseline;
+	};
+	// Fire one thruster group: scale the requested delta-v down to what can be
+	// afforded, pay for it, and return the delta-v actually delivered.
+	auto burn = [&](double dv, double capacity, const ResourceLevels &fullCost) -> double
+	{
+		if(!dv || capacity <= 0.)
+			return 0.;
+		double throttle = fabs(dv) / capacity;
+		double available = AvailableResources().FractionalUsage(fullCost * throttle);
+		if(available < 1.)
+		{
+			throttle *= available;
+			dv *= available;
+			saturated = true;
+		}
+		levels.Damage(fullCost, throttle);
+		return dv;
+	};
+	dvLateral = burn(dvLateral, lateralAccel, groupCost(lateralCost));
+	if(mainPart > 0.)
+		mainPart = burn(mainPart, forwardAccel, thrustCost);
+	else if(mainPart < 0.)
+		mainPart = burn(mainPart, retroAccel, groupCost(reverseCost));
+	if(afterburnerPart > 0. && afterburnerAccel > 0.)
+	{
+		levels.Damage(afterburnerCost, afterburnerPart / afterburnerAccel);
+		isUsingAfterburner = !forget;
+	}
+	dvForward = mainPart + afterburnerPart;
+
+	velocity = NewtonianFlight::Apply(velocity, facing, dvForward, dvLateral, plan.softCapFactor);
+	if(assist && commands.Has(Command::STOP) && velocity.Length() < 1e-3)
+		velocity = Point();
+
+	// Engine flares. Ignore tiny corrections so that cruising doesn't flicker.
+	const double flareThreshold = .05 * forwardAccel;
+	if(dvForward > flareThreshold)
+	{
+		isThrusting = true;
+		IncrementThrusterHeld(ThrustKind::FORWARD);
+	}
+	else if(dvForward < -flareThreshold)
+	{
+		isReversing = true;
+		IncrementThrusterHeld(ThrustKind::REVERSE);
+	}
+	// Lateral thrusters (A3) use the steering flares and sounds for now.
+	if(fabs(dvLateral) > flareThreshold)
+	{
+		isSteering = true;
+		IncrementThrusterHeld(dvLateral < 0. ? ThrustKind::LATERAL_LEFT : ThrustKind::LATERAL_RIGHT);
+	}
+
+	if(!assist)
+		flightAssistState = HasFlightComputer() ? FlightAssistState::OFF : FlightAssistState::NO_COMPUTER;
+	else if(braking)
+		flightAssistState = FlightAssistState::BRAKING;
+	else if(saturated)
+		flightAssistState = FlightAssistState::LIMIT;
+	else
+		flightAssistState = FlightAssistState::ON;
 }
 
 

@@ -123,6 +123,10 @@ public:
 		RIGHT = 1,
 		FORWARD = 2,
 		REVERSE = 3,
+		// Manoeuvring thrusters pushing the ship sideways (Newtonian flight, A3).
+		// Until ships define lateral flare points, they use the steering flares.
+		LATERAL_LEFT = 4,
+		LATERAL_RIGHT = 5,
 	};
 
 	enum class CanFireResult {
@@ -473,6 +477,44 @@ public:
 	// accounting for the effects of insufficient crew.
 	double CrewAcceleration() const;
 	double CrewTurnRate() const;
+
+	// Newtonian flight proof of concept (plans/flight-simulation-A.md).
+	// Only the player's flagship flies Newtonian, and only when the
+	// "newtonian flight" gamerule is on. Everything else uses drag physics.
+	enum class FlightAssistState {OFF, ON, LIMIT, BRAKING, NO_COMPUTER};
+	void SetNewtonian(bool value);
+	bool IsNewtonian() const;
+	// The flight assist toggle. Resets to on at every launch or load, unless the
+	// "Remember flight assist state" preference is set.
+	void ToggleFlightAssist();
+	void SetFlightAssist(bool value);
+	// Whether assist is actually on: toggled on, and a flight computer is installed.
+	bool FlightAssist() const;
+	// Whether a flight computer outfit is installed (A5.4). Without one, the ship
+	// can only fly with assist off.
+	bool HasFlightComputer() const;
+	// The fraction of this ship's velocity its projectiles inherit (A5.8):
+	// a gamerule for Newtonian ships, and all of it for everything else.
+	double ProjectileVelocityInheritance() const;
+	// While an autopilot (land, jump, board) is flying, use legacy drag
+	// physics so that the existing AI routines keep working.
+	void SetNewtonianAutopilot(bool value);
+	// True when this ship is currently flying with Newtonian physics.
+	bool UsesNewtonianPhysics() const;
+	FlightAssistState GetFlightAssistState() const;
+	// The speed the flight computer holds to: today's drag-based top speed,
+	// raised to the boosted speed while the afterburner is held.
+	double RatedSpeed() const;
+	// The soft cap above rated speed, as a multiple of it (from the gamerules).
+	double NewtonianSoftCap() const;
+	// Current angular velocity, in degrees per frame.
+	double AngularVelocity() const;
+	// Angular acceleration available, in degrees per frame per frame.
+	double AngularAcceleration() const;
+	// Frames this ship needs to spin up to its rated turn rate (gamerule, scaled by mass).
+	double SpinUpFrames() const;
+	// Retro thrust acceleration, including the built-in baseline thrusters.
+	double NewtonianRetroAcceleration() const;
 	// The ship's current speed right now
 	double CurrentSpeed() const;
 
@@ -697,6 +739,7 @@ private:
 	void DoInitializeMovement();
 	void StepPilot();
 	void DoMovement(bool &isUsingAfterburner);
+	void DoNewtonianMovement(bool &isUsingAfterburner);
 	void StepTargeting();
 	void DoEngineVisuals(std::vector<Visual> &visuals, bool isUsingAfterburner) const;
 
@@ -756,6 +799,13 @@ private:
 	bool isReversing = false;
 	bool isSteering = false;
 	double steeringDirection = 0.;
+	// Newtonian flight proof of concept state.
+	bool isNewtonian = false;
+	bool flightAssist = true;
+	bool newtonianAutopilot = false;
+	double angularVelocity = 0.;
+	double ratedSpeed = 0.;
+	FlightAssistState flightAssistState = FlightAssistState::ON;
 	bool isCapturable = true;
 	bool isInvisible = false;
 	const Swizzle *customSwizzle = nullptr;
@@ -814,7 +864,7 @@ private:
 	// Acceleration can be created by engines, firing weapons, or weapon impacts.
 	Point acceleration;
 	// The amount of time in frames that an engine has been on for.
-	std::array<uint8_t, 4> thrustHeldFrames = {};
+	std::array<uint8_t, 6> thrustHeldFrames = {};
 
 	std::optional<int> administrativeCost;
 	int crew = 0;

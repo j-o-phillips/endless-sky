@@ -43,6 +43,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "RoutePlan.h"
 #include "ScanType.h"
 #include "Ship.h"
+#include "ship/NewtonianFlight.h"
 #include "ship/ShipAICache.h"
 #include "ShipEvent.h"
 #include "ShipJumpNavigation.h"
@@ -74,6 +75,22 @@ namespace {
 		if(activeCommands.Has(Command::AFTERBURNER) && flagship.CanUseAfterburner())
 			return true;
 		return false;
+	}
+
+	// Newtonian flight proof of concept: turn toward a direction with angular
+	// momentum, starting to counter-turn in time to stop on the target angle
+	// (plans/flight-simulation-A.md, A2). The ship's turn command means
+	// "turn at this rate" with flight assist on, and "apply this torque" with it off.
+	double NewtonianTurnToward(const Ship &ship, double cross, double dot, double precision)
+	{
+		double ratedTurn = ship.TrueTurnRate();
+		double angularAccel = ship.TurnRate() > 0. ? ship.AngularAcceleration() * ratedTurn / ship.TurnRate() : 0.;
+		// Degrees still to turn; positive means turning right.
+		double delta = -atan2(cross, dot) * TO_DEG;
+		bool close = precision < 1. && precision > 0. && dot > 0.
+			&& dot * dot >= precision * (cross * cross + dot * dot);
+		return NewtonianFlight::TurnToward(ship.FlightAssist(), delta, ship.AngularVelocity(),
+			ratedTurn, angularAccel, close);
 	}
 
 	bool NeedsFuel(const Ship &ship)
@@ -559,11 +576,32 @@ void AI::UpdateKeys(PlayerInfo &player, const Command &activeCommands)
 	escortsUseAmmo = Preferences::Has("Escorts expend ammo");
 	escortsAreFrugal = Preferences::Has("Escorts use ammo frugally");
 
+	// Newtonian flight proof of concept: toggle flight assist (A5.9).
+	if(activeCommands.Has(Command::FLIGHT_ASSIST) && flagship->IsNewtonian())
+	{
+		if(!flagship->HasFlightComputer())
+			Messages::Add({"No flight computer installed: flight assist is unavailable.",
+				GameData::MessageCategories().Get("normal")});
+		else
+		{
+			player.Flagship()->ToggleFlightAssist();
+			Messages::Add({string("Flight assist ") + (flagship->FlightAssist() ? "on." : "off."),
+				GameData::MessageCategories().Get("normal")});
+		}
+	}
+	bool newtonianStopIgnored = flagship->IsNewtonian() && !flagship->FlightAssist();
+
 	if(!autoPilot.Has(Command::STOP) && activeCommands.Has(Command::STOP)
 			&& flagship->Velocity().Length() > VELOCITY_ZERO)
-		Messages::Add(*GameData::Messages().Get("coming to a stop"));
+	{
+		if(newtonianStopIgnored)
+			Messages::Add({"Flight assist is off: brake manually.", GameData::MessageCategories().Get("normal")});
+		else
+			Messages::Add(*GameData::Messages().Get("coming to a stop"));
+	}
 
 	autoPilot |= activeCommands;
+	autoPilot.Clear(Command::FLIGHT_ASSIST | Command::STRAFE_LEFT | Command::STRAFE_RIGHT);
 	if(ShouldCancelAutopilot(*flagship, activeCommands))
 	{
 		bool canceled = (autoPilot.Has(Command::JUMP) && !activeCommands.Has(Command::JUMP | Command::FLEET_JUMP));
@@ -2575,6 +2613,8 @@ double AI::TurnToward(const Ship &ship, const Point &vector, const double precis
 	double cross = vector.Cross(facing);
 
 	double dot = vector.Dot(facing);
+	if(ship.UsesNewtonianPhysics())
+		return NewtonianTurnToward(ship, cross, dot, precision);
 	if(dot > 0.)
 	{
 		// Is the facing direction aligned with the target direction with sufficient precision?
@@ -4955,7 +4995,7 @@ void AI::MovePlayer(Ship &ship, Command &activeCommands)
 		AutoFire(ship, firingCommands, false, true, &player.SelectedSecondaryWeapons());
 
 	const bool mouseTurning = activeCommands.Has(Command::MOUSE_TURNING_HOLD);
-	if(mouseTurning && !ship.IsBoarding() && (!ship.IsReversing() || ship.ReverseThrust()))
+	if(mouseTurning && !ship.IsBoarding() && (!ship.IsReversing() || ship.ReverseThrust() || ship.IsNewtonian()))
 		command.SetTurn(TurnToward(ship, mousePosition));
 
 	if(activeCommands)
@@ -4964,7 +5004,28 @@ void AI::MovePlayer(Ship &ship, Command &activeCommands)
 			command |= Command::FORWARD;
 		if(activeCommands.Has(Command::RIGHT | Command::LEFT) && !mouseTurning)
 			command.SetTurn(activeCommands.Has(Command::RIGHT) - activeCommands.Has(Command::LEFT));
-		if(activeCommands.Has(Command::BACK))
+		if(ship.IsNewtonian())
+			command |= activeCommands.And(Command::STRAFE_LEFT | Command::STRAFE_RIGHT);
+		// Newtonian flight (A5.1, revised 2026-11-06). With assist off, BACK is raw
+		// retro thrust (every hull has some) and never turns the ship around. With
+		// assist on, holding BACK is a flip and burn: the ship turns to face its
+		// retrograde while the flight computer brakes with every thruster that
+		// helps, which is the main engine at full thrust once it has turned round.
+		if(ship.IsNewtonian() && !ship.FlightAssist())
+		{
+			if(activeCommands.Has(Command::BACK) && !activeCommands.Has(Command::FORWARD))
+				command |= Command::BACK;
+		}
+		else if(ship.IsNewtonian())
+		{
+			if(activeCommands.Has(Command::BACK) && !activeCommands.Has(Command::FORWARD))
+			{
+				command |= Command::STOP;
+				if(!activeCommands.Has(Command::RIGHT | Command::LEFT | Command::AUTOSTEER))
+					command.SetTurn(TurnBackward(ship));
+			}
+		}
+		else if(activeCommands.Has(Command::BACK))
 		{
 			if(!activeCommands.Has(Command::FORWARD) && ship.ReverseThrust())
 				command |= Command::BACK;
@@ -5068,6 +5129,23 @@ void AI::MovePlayer(Ship &ship, Command &activeCommands)
 			command |= Command::LAND;
 		}
 	}
+	else if(autoPilot.Has(Command::STOP) && ship.IsNewtonian())
+	{
+		// Newtonian flight: with assist on, the flight computer brakes the ship
+		// itself, keeping its facing. With assist off, STOP does nothing (A5.1).
+		if(!ship.FlightAssist() || ship.Velocity().Length() <= VELOCITY_ZERO)
+			autoPilot.Clear(Command::STOP);
+		else
+		{
+			command |= Command::STOP;
+			// Flip and burn when that is faster than braking on retro and lateral
+			// thrust while keeping the current facing.
+			double spinUpFrames = ship.AngularAcceleration() > 0. ? ship.TurnRate() / ship.AngularAcceleration() : 0.;
+			if(NewtonianFlight::ShouldFlipAndBurn(ship.Velocity(), ship.Facing().Unit(), ship.TrueAcceleration(),
+					ship.NewtonianRetroAcceleration(), ship.TrueTurnRate(), spinUpFrames))
+				command.SetTurn(TurnToward(ship, -ship.Velocity()));
+		}
+	}
 	else if(autoPilot.Has(Command::STOP))
 	{
 		// STOP is automatically cleared once the ship has stopped.
@@ -5130,6 +5208,10 @@ void AI::MovePlayer(Ship &ship, Command &activeCommands)
 	if(player.IsCloaking())
 		command |= Command::CLOAK;
 
+	// Newtonian flight: the landing, jump and boarding autopilots fly with legacy
+	// drag physics, so the existing AI routines keep working (A5.1).
+	ship.SetNewtonianAutopilot(ship.IsNewtonian()
+		&& autoPilot.Has(Command::LAND | Command::JUMP | Command::FLEET_JUMP | Command::BOARD));
 	ship.SetCommands(command);
 	ship.SetCommands(firingCommands);
 }
