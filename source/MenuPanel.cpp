@@ -33,6 +33,8 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "PlayerInfo.h"
 #include "Point.h"
 #include "PreferencesPanel.h"
+#include "Sandbox.h"
+#include "SandboxPanel.h"
 #include "SavedGame.h"
 #include "Ship.h"
 #include "shader/StarField.h"
@@ -81,6 +83,10 @@ MenuPanel::MenuPanel(PlayerInfo &player, UI &gamePanels)
 		Logger::Log("Interface \"main menu\" does not contain a box for \"credits\".", Logger::Level::WARNING);
 		showCreditsWarning = false;
 	}
+
+	// Opening the main menu ends any sandbox scenario and brings back the real pilot.
+	if(Sandbox::IsActive())
+		Sandbox::Exit(player, gamePanels);
 
 	if(gamePanels.IsEmpty())
 	{
@@ -164,6 +170,8 @@ void MenuPanel::Draw()
 	}
 	if(player.IsLoaded() && !player.Pilot()->IsLocked() && !player.Pilot()->GetGamerules().LockGamerules())
 		info.SetCondition("gamerules unlocked");
+	if(Sandbox::IsEnabled())
+		info.SetCondition("sandbox");
 
 	GameData::Interfaces().Get("menu background")->Draw(info, this);
 	mainMenuUi->Draw(info, this);
@@ -217,6 +225,8 @@ bool MenuPanel::KeyDown(SDL_Keycode key, Uint16 mod, const Command &command, boo
 		panel->SetCallback(player.Pilot().get(), &PilotProfile::Save);
 		GetUI().Push(panel);
 	}
+	else if(key == 'x' && Sandbox::IsEnabled())
+		GetUI().Push(new SandboxPanel(player, gamePanels));
 	else if(key == 'q')
 	{
 		GetUI().Quit();

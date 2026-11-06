@@ -373,6 +373,15 @@ void Engine::Place()
 
 
 
+void Engine::AddSandboxShips(const vector<shared_ptr<Ship>> &npcs)
+{
+	ships.insert(ships.end(), npcs.begin(), npcs.end());
+	if(const shared_ptr<Ship> &flagship = player.FlagshipPtr())
+		camera.SnapTo(flagship->Center());
+}
+
+
+
 // Add NPC ships to the known ships. These may have been freshly instantiated
 // from an accepted assisting/boarding mission, or from existing missions when
 // the player departs a planet.

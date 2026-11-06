@@ -700,6 +700,13 @@ const Set<Test> &GameData::Tests()
 
 
 
+const Set<SandboxScenario> &GameData::SandboxScenarios()
+{
+	return objects.sandboxScenarios;
+}
+
+
+
 const Set<TestData> &GameData::TestDataSets()
 {
 	return objects.testDataSets;

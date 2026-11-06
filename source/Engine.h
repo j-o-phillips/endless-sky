@@ -74,6 +74,9 @@ public:
 	void Place();
 	// Place NPCs spawned by a mission that offers when the player is not landed.
 	void Place(const std::list<NPC> &npcs, const std::shared_ptr<Ship> &flagship = nullptr);
+	// Developer sandbox: add already-positioned NPC ships to the current system
+	// and re-centre the camera on the flagship. Call after Place(), before Go().
+	void AddSandboxShips(const std::vector<std::shared_ptr<Ship>> &npcs);
 
 	// Wait for the previous calculations (if any) to be done.
 	void Wait();

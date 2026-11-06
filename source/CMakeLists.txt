@@ -297,6 +297,12 @@ target_sources(EndlessSkyLib PRIVATE
 	RoutePlan.cpp
 	RoutePlan.h
 	Sale.h
+	Sandbox.cpp
+	Sandbox.h
+	SandboxPanel.cpp
+	SandboxPanel.h
+	SandboxScenario.cpp
+	SandboxScenario.h
 	SavedGame.cpp
 	SavedGame.h
 	ScanType.h
