@@ -59,6 +59,7 @@ class Planet;
 class PlayerInfo;
 class Point;
 class Politics;
+class SandboxScenario;
 class Shader;
 class Ship;
 class ShipEvent;
@@ -152,6 +153,7 @@ public:
 	static const Set<Shop<Ship>> &Shipyards();
 	static const Set<System> &Systems();
 	static const Set<Test> &Tests();
+	static const Set<SandboxScenario> &SandboxScenarios();
 	static const Set<TestData> &TestDataSets();
 	static const Set<Wormhole> &Wormholes();
 	static const Set<Gamerules> &GamerulesPresets();

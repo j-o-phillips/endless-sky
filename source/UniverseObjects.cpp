@@ -580,6 +580,12 @@ void UniverseObjects::LoadFile(const filesystem::path &path, const PlayerInfo &p
 				*system = System();
 			system->Load(node, planets, playerConditions);
 		}
+		else if(key == "sandbox" && hasValue)
+		{
+			SandboxScenario *scenario = sandboxScenarios.Get(node.Token(1));
+			*scenario = SandboxScenario();
+			scenario->Load(node);
+		}
 		else if(key == "test" && hasValue)
 		{
 			Test *test = tests.Get(node.Token(1));

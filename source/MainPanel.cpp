@@ -34,6 +34,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "PlayerInfo.h"
 #include "PlayerInfoPanel.h"
 #include "Preferences.h"
+#include "Sandbox.h"
 #include "Ship.h"
 #include "ShipEvent.h"
 #include "StellarObject.h"
@@ -209,6 +210,11 @@ Engine &MainPanel::GetEngine()
 // Only override the ones you need; the default action is to return false.
 bool MainPanel::KeyDown(SDL_Keycode key, Uint16 mod, const Command &command, bool isNewPress)
 {
+	if(key == SDLK_F5 && Sandbox::IsActive())
+	{
+		Sandbox::RequestRestart();
+		return true;
+	}
 	if(player.IsDead())
 		return true;
 

@@ -1,0 +1,47 @@
+# Developer sandbox scenarios. Only reachable when the game is started with
+# --sandbox, via the "Sandbox" button on the main menu. See source/SandboxScenario.h.
+#
+# sandbox "<name>"
+# 	description "<text>"
+# 	gamerules "<preset name>"   # optional; default: inherit the loaded pilot's gamerules
+# 	system "<system>"
+# 	flagship "<ship model>"
+# 		name "<name>"            # optional
+# 		position <x> <y>         # +x is right, +y is down
+# 		velocity <x> <y>
+# 		facing <degrees>         # 0 is up, 90 is right
+# 	npc "<ship model>"           # any number of these
+# 		(same keys as flagship, plus:)
+# 		government "<government>"  # required for NPCs
+# 		personality <personality tokens...>
+#
+# An NPC with no target in a system with no stellar objects or links does
+# nothing, so a "pacifist" NPC in the Sandbox Void sits perfectly still.
+# (Don't use "staying": that makes it drift to the system centre.)
+
+system "Sandbox Void"
+	pos 20000 20000
+	government Uninhabited
+	hidden
+	inaccessible
+	"no raids"
+
+government "Sandbox Target"
+	"display name" "Sandbox Target"
+	color .9 .5 .1
+	"bribe" 0
+	"fine" 0
+
+sandbox "Empty space: 1 NPC"
+	description "Empty space with no planets, fleets or hazards. Your ship starts at the centre, and a passive target sits 600 units ahead, facing you."
+	system "Sandbox Void"
+	flagship "Sparrow"
+		name "Sandbox"
+		position 0 0
+		facing 0
+	npc "Shuttle"
+		name "Target Dummy"
+		government "Sandbox Target"
+		personality pacifist
+		position 0 -600
+		facing 180

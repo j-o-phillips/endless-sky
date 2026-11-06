@@ -41,6 +41,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "Preferences.h"
 #include "PrintData.h"
 #include "Random.h"
+#include "Sandbox.h"
 #include "Screen.h"
 #include "image/SpriteSet.h"
 #include "shader/SpriteShader.h"
@@ -139,6 +140,8 @@ int main(int argc, char *argv[])
 			conversation = LoadConversation(player);
 		else if(arg == "-d" || arg == "--debug")
 			debugMode = true;
+		else if(arg == "--sandbox")
+			Sandbox::Enable();
 		else if(arg == "-p" || arg == "--parse-save")
 			loadOnly = true;
 		else if(arg == "--parse-assets")
@@ -447,6 +450,8 @@ void GameLoop(PlayerInfo &player, TaskQueue &queue, const Conversation &conversa
 			chrono::steady_clock::time_point start = chrono::steady_clock::now();
 
 			ProcessEvents();
+			// Restart a sandbox scenario if asked to, now that no panel is mid-event.
+			Sandbox::Step(player, gamePanels);
 
 			SDL_Keymod mod = SDL_GetModState();
 			Font::ShowUnderlines(mod & KMOD_ALT);
@@ -596,6 +601,7 @@ void GameLoop(PlayerInfo &player, TaskQueue &queue, const Conversation &conversa
 		while(!menuPanels.IsDone())
 		{
 			ProcessEvents();
+			Sandbox::Step(player, gamePanels);
 
 			// Handle any integration test steps.
 			if(dataFinishedLoading)
@@ -665,6 +671,7 @@ void PrintHelp()
 	cerr << "    -r, --resources <path>: load resources from given directory." << endl;
 	cerr << "    -c, --config <path>: save user's files to given directory." << endl;
 	cerr << "    -d, --debug: turn on debugging features (e.g. Caps Lock slows down instead of speeds up)." << endl;
+	cerr << "    --sandbox: show the developer sandbox scenarios in the main menu." << endl;
 	cerr << "    -p, --parse-save: load the most recent saved game and inspect it for content errors." << endl;
 	cerr << "    --parse-assets: load all game data, images, and sounds,"
 		" and the latest save game, and inspect data for errors." << endl;

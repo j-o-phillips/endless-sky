@@ -347,6 +347,13 @@ interface "main menu"
 	button m "_Manage Pilots..."
 		center 300 155
 		dimensions 120 30
+	visible if "sandbox"
+	sprite "ui/wide button"
+		center 300 195
+	button x "Sand bo_x"
+		center 300 195
+		dimensions 90 30
+	visible
 	
 	# Left panel (credits):
 	button q "_Quit"
