@@ -251,6 +251,10 @@ private:
 
 	// Command applied by the player's "autopilot."
 	Command autoPilot;
+	// Under Newtonian flight, whether the player's current STOP flips and burns.
+	// Decided once when the STOP begins, so the ship doesn't dither between
+	// turning and holding its facing when the two stops are close.
+	std::optional<bool> newtonianStopFlip;
 	// Position of the cursor, for when the player is using mouse turning or manual turret aiming.
 	Point mousePosition;
 	// General firing command for ships. This is a data member to avoid

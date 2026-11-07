@@ -28,6 +28,107 @@ namespace {
 	{
 		return Point(-facing.Y(), facing.X());
 	}
+
+	// The AI counts a ship as facing its target within this many degrees: the
+	// angle for AI::TurnToward's default precision of 0.9999.
+	const double ALIGNED_DEGREES = acos(sqrt(.9999)) * TO_DEG;
+
+	// Degrees to turn right to face retrograde, in [-180, 180].
+	double DegreesToRetrograde(const Point &heading, const Point &velocity)
+	{
+		const Point retrograde = -velocity;
+		return atan2(heading.Cross(retrograde), heading.Dot(retrograde)) * TO_DEG;
+	}
+
+	// One axis of velocity braked to zero, as PlanTranslation does it: each frame
+	// takes off up to the given delta-v, and the ship then moves by the new velocity.
+	struct AxisStop {
+		bool canStop = true;
+		double frames = 0.;
+		double distance = 0.;
+	};
+	AxisStop BrakeAxis(double speed, double accel)
+	{
+		AxisStop stop;
+		if(speed <= 0.)
+			return stop;
+		if(accel <= 0.)
+		{
+			stop.canStop = false;
+			return stop;
+		}
+		// After k frames the speed is speed - k * accel. The last frame takes off
+		// whatever is left, ending exactly at rest, so it adds no distance.
+		const double ratio = speed / accel;
+		const double full = floor(ratio);
+		stop.frames = ceil(ratio);
+		stop.distance = full * speed - accel * full * (full + 1.) / 2.;
+		return stop;
+	}
+
+	// Stepped predictions give up after this many frames.
+	constexpr int MAX_STEPPED_FRAMES = 10000;
+
+	// STOP with the facing held still: retro (or the main engine, if moving
+	// backwards) brakes along the facing, and lateral thrust brakes across it.
+	NewtonianFlight::StopPrediction StopAtFixedFacing(const Point &velocity, const Point &facing,
+		const NewtonianFlight::Braking &braking)
+	{
+		NewtonianFlight::StopPrediction stop;
+		const Point right = RightOf(facing);
+		const double forwardSpeed = velocity.Dot(facing);
+		const double lateralSpeed = velocity.Dot(right);
+		const AxisStop forward = BrakeAxis(fabs(forwardSpeed), forwardSpeed > 0. ? braking.retro : braking.main);
+		const AxisStop lateral = BrakeAxis(fabs(lateralSpeed), braking.lateral);
+		stop.canStop = forward.canStop && lateral.canStop;
+		if(!stop.canStop)
+			return stop;
+		stop.frames = max(forward.frames, lateral.frames);
+		stop.displacement = facing * copysign(forward.distance, forwardSpeed)
+			+ right * copysign(lateral.distance, lateralSpeed);
+		return stop;
+	}
+
+	// A ship flying STOP with assist on, one frame at a time, as
+	// Ship::DoNewtonianMovement does it: rotation first, then each axis braked
+	// with the facing from the start of the frame, then the ship moves.
+	struct BrakingShip {
+		BrakingShip(const Point &velocity, const Point &facing, double angularVelocity,
+			const NewtonianFlight::Braking &braking)
+			: braking(braking), angle(atan2(facing.X(), -facing.Y()) * TO_DEG), heading(facing),
+			angularVelocity(angularVelocity), velocity(velocity)
+		{
+			angularAccel = braking.spinUpFrames > 0. ? braking.ratedTurn / braking.spinUpFrames : braking.ratedTurn;
+		}
+
+		void Step(double turnInput)
+		{
+			angularVelocity += NewtonianFlight::PlanRotation(true, turnInput, angularVelocity,
+				braking.ratedTurn, angularAccel, 1.).deltaOmega;
+			if(fabs(angularVelocity) < 1e-6)
+				angularVelocity = 0.;
+
+			const Point right = RightOf(heading);
+			const double forwardSpeed = velocity.Dot(heading);
+			const double lateralSpeed = velocity.Dot(right);
+			velocity -= heading * clamp(forwardSpeed, -braking.main, braking.retro)
+				+ right * clamp(lateralSpeed, -braking.lateral, braking.lateral);
+			displacement += velocity;
+			++frames;
+
+			angle += angularVelocity;
+			heading = Point(sin(angle * TO_RAD), -cos(angle * TO_RAD));
+		}
+
+		const NewtonianFlight::Braking &braking;
+		double angularAccel = 0.;
+		double angle = 0.;
+		Point heading;
+		double angularVelocity = 0.;
+		Point velocity;
+		Point displacement;
+		int frames = 0;
+	};
 }
 
 
@@ -171,14 +272,98 @@ double NewtonianFlight::TurnToward(bool assist, double delta, double angularVelo
 
 
 
-bool NewtonianFlight::ShouldFlipAndBurn(const Point &velocity, const Point &facing, double mainAccel,
-	double retroAccel, double ratedTurn, double spinUpFrames)
+NewtonianFlight::StopPrediction NewtonianFlight::PredictStopKeepingFacing(const Point &velocity,
+	const Point &facing, double angularVelocity, const Braking &braking)
 {
-	double speed = velocity.Length();
-	if(mainAccel <= 0. || ratedTurn <= 0. || speed <= mainAccel)
-		return false;
-	double retroTime = retroAccel > 0. ? speed / retroAccel : 1e9;
-	double flipAngle = acos(clamp(-velocity.Unit().Dot(facing), -1., 1.)) * TO_DEG;
-	double flipTime = flipAngle / ratedTurn + spinUpFrames + speed / mainAccel;
-	return flipTime < retroTime;
+	// The computer brakes any spin first, and the facing swings round while it
+	// does: step through that, braking as it goes, then the rest is exact.
+	BrakingShip ship(velocity, facing, angularVelocity, braking);
+	if(ship.angularAccel > 0.)
+		while(ship.angularVelocity && ship.velocity && ship.frames < MAX_STEPPED_FRAMES)
+			ship.Step(0.);
+	StopPrediction stop = StopAtFixedFacing(ship.velocity, ship.heading, braking);
+	stop.frames += ship.frames;
+	stop.displacement += ship.displacement;
+	return stop;
+}
+
+
+
+NewtonianFlight::StopPrediction NewtonianFlight::PredictFlipAndBurn(const Point &velocity,
+	const Point &facing, double angularVelocity, const Braking &braking)
+{
+	StopPrediction stop;
+	stop.flip = true;
+	if(!velocity)
+		return stop;
+	if(braking.ratedTurn <= 0. || braking.main <= 0.)
+	{
+		stop.canStop = false;
+		return stop;
+	}
+	// Step through the turn frame by frame, with the same turn controller the AI
+	// uses: the ship keeps braking while it turns, on retro (or the main engine,
+	// once it faces away from the motion) along its facing and lateral thrust
+	// across it. The turn is short, so this is cheap. Once it faces retrograde,
+	// the rest of the stop is the exact formula.
+	BrakingShip ship(velocity, facing, angularVelocity, braking);
+	while(ship.velocity && ship.frames < MAX_STEPPED_FRAMES)
+	{
+		const double remaining = DegreesToRetrograde(ship.heading, ship.velocity);
+		const bool close = fabs(remaining) < ALIGNED_DEGREES;
+		if(close && fabs(ship.angularVelocity) <= ship.angularAccel)
+			break;
+		ship.Step(TurnToward(true, remaining, ship.angularVelocity, braking.ratedTurn, ship.angularAccel, close));
+	}
+	const StopPrediction burn = StopAtFixedFacing(ship.velocity, ship.heading, braking);
+	stop.frames = ship.frames + burn.frames;
+	stop.displacement = ship.displacement + burn.displacement;
+	return stop;
+}
+
+
+
+NewtonianFlight::StopPrediction NewtonianFlight::PredictStop(const Point &velocity, const Point &facing,
+	double angularVelocity, const Braking &braking)
+{
+	StopPrediction keep = PredictStopKeepingFacing(velocity, facing, angularVelocity, braking);
+	// If one frame of main thrust would stop the ship, there is nothing to flip for.
+	if(keep.canStop && velocity.Length() <= braking.main)
+		return keep;
+	StopPrediction flip = PredictFlipAndBurn(velocity, facing, angularVelocity, braking);
+	if(!flip.canStop)
+		return keep;
+	if(!keep.canStop || flip.frames < keep.frames)
+		return flip;
+	return keep;
+}
+
+
+
+bool NewtonianFlight::ShouldFlipAndBurn(const Point &velocity, const Point &facing, double angularVelocity,
+	const Braking &braking)
+{
+	return PredictStop(velocity, facing, angularVelocity, braking).flip;
+}
+
+
+
+double NewtonianFlight::ClosingSpeed(const Point &relativePosition, const Point &relativeVelocity)
+{
+	if(!relativePosition)
+		return 0.;
+	return -relativeVelocity.Dot(relativePosition.Unit());
+}
+
+
+
+NewtonianFlight::Approach NewtonianFlight::ClosestApproach(const Point &relativePosition,
+	const Point &relativeVelocity)
+{
+	Approach approach;
+	const double speedSquared = relativeVelocity.LengthSquared();
+	if(speedSquared > 0.)
+		approach.frames = max(0., -relativePosition.Dot(relativeVelocity) / speedSquared);
+	approach.distance = (relativePosition + relativeVelocity * approach.frames).Length();
+	return approach;
 }

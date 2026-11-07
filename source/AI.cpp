@@ -4519,6 +4519,8 @@ void AI::MovePlayer(Ship &ship, Command &activeCommands)
 	firingCommands.SetHardpoints(ship.Weapons().size(), ship.Decorations().size());
 
 	bool shift = activeCommands.Has(Command::SHIFT);
+	if(!autoPilot.Has(Command::STOP))
+		newtonianStopFlip.reset();
 
 	bool isWormhole = false;
 	if(player.HasTravelPlan())
@@ -5139,10 +5141,11 @@ void AI::MovePlayer(Ship &ship, Command &activeCommands)
 		{
 			command |= Command::STOP;
 			// Flip and burn when that is faster than braking on retro and lateral
-			// thrust while keeping the current facing.
-			double spinUpFrames = ship.AngularAcceleration() > 0. ? ship.TurnRate() / ship.AngularAcceleration() : 0.;
-			if(NewtonianFlight::ShouldFlipAndBurn(ship.Velocity(), ship.Facing().Unit(), ship.TrueAcceleration(),
-					ship.NewtonianRetroAcceleration(), ship.TrueTurnRate(), spinUpFrames))
+			// thrust while keeping the current facing. Decide once per STOP.
+			if(!newtonianStopFlip)
+				newtonianStopFlip = NewtonianFlight::ShouldFlipAndBurn(ship.Velocity(), ship.Facing().Unit(),
+					ship.AngularVelocity(), ship.NewtonianBraking());
+			if(*newtonianStopFlip)
 				command.SetTurn(TurnToward(ship, -ship.Velocity()));
 		}
 	}

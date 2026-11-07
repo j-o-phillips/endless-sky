@@ -63,6 +63,10 @@ class Swizzle;
 class System;
 class Visual;
 
+namespace NewtonianFlight {
+	struct Braking;
+}
+
 
 
 // Class representing a ship (either a model for sale or an instance of it). A
@@ -513,8 +517,9 @@ public:
 	double AngularAcceleration() const;
 	// Frames this ship needs to spin up to its rated turn rate (gamerule, scaled by mass).
 	double SpinUpFrames() const;
-	// Retro thrust acceleration, including the built-in baseline thrusters.
-	double NewtonianRetroAcceleration() const;
+	// What this ship can brake with under Newtonian flight: each thruster group,
+	// including the built-in baseline thrusters, and its turning (A6 step 2).
+	NewtonianFlight::Braking NewtonianBraking() const;
 	// The ship's current speed right now
 	double CurrentSpeed() const;
 
