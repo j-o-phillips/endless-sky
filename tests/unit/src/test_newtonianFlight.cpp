@@ -27,6 +27,7 @@ namespace { // test namespace
 
 using namespace NewtonianFlight;
 using Catch::Matchers::WithinAbs;
+using Catch::Matchers::WithinRel;
 
 constexpr double PI = 3.14159265358979323846;
 constexpr double TO_RAD = PI / 180.;
@@ -58,6 +59,17 @@ Input Thrust(double thrust = 1.)
 	return input;
 }
 
+Braking ShipBraking(double lateral = BASELINE)
+{
+	Braking braking;
+	braking.main = FORWARD;
+	braking.retro = BASELINE;
+	braking.lateral = lateral;
+	braking.ratedTurn = RATED_TURN;
+	braking.spinUpFrames = RATED_TURN / ANGULAR_ACCEL;
+	return braking;
+}
+
 Input Stop()
 {
 	Input input;
@@ -84,14 +96,18 @@ struct Sim {
 	double angle = 0.;
 	double angularVelocity = 0.;
 	Point velocity;
+	// Moved by the new velocity after each frame, as Ship::Move does.
+	Point position;
 	double rated = RATED_SPEED;
+	double ratedTurn = RATED_TURN;
+	double angularAccel = ANGULAR_ACCEL;
 	Thrusters thrusters = ShipThrusters();
 
 	TranslationPlan Step(const Input &input, double turnInput = 0.)
 	{
 		// Translation uses the facing from the start of the frame.
 		const Point facing = Unit(angle);
-		RotationPlan rotation = PlanRotation(assist, turnInput, angularVelocity, RATED_TURN, ANGULAR_ACCEL, SOFT_CAP);
+		RotationPlan rotation = PlanRotation(assist, turnInput, angularVelocity, ratedTurn, angularAccel, SOFT_CAP);
 		angularVelocity += rotation.deltaOmega * rotation.capFactor;
 		if(std::fabs(angularVelocity) < 1e-6)
 			angularVelocity = 0.;
@@ -101,9 +117,47 @@ struct Sim {
 		velocity = Apply(velocity, facing, plan.dvForward, plan.dvLateral, plan.softCapFactor);
 		if(assist && input.stop && velocity.Length() < 1e-3)
 			velocity = Point();
+		position += velocity;
 		return plan;
 	}
 };
+
+// The angle within which AI::TurnToward (default precision 0.9999) counts a ship
+// as facing its target.
+const double ALIGNED_DEGREES = std::acos(std::sqrt(.9999)) * TO_DEG;
+
+// The braking a Sim has, as Ship::NewtonianBraking reports it.
+Braking SimBraking(const Sim &sim)
+{
+	Braking braking;
+	braking.main = sim.thrusters.forward;
+	braking.retro = sim.thrusters.retro;
+	braking.lateral = sim.thrusters.lateral;
+	braking.ratedTurn = sim.ratedTurn;
+	braking.spinUpFrames = sim.ratedTurn / sim.angularAccel;
+	return braking;
+}
+
+// Fly STOP the way AI::MovePlayer does: decide once whether to flip and burn,
+// then turn toward retrograde every frame if so. Returns the frames it took.
+int FlyStop(Sim &sim, int maxFrames = 5000)
+{
+	const bool flip = ShouldFlipAndBurn(sim.velocity, Unit(sim.angle), sim.angularVelocity, SimBraking(sim));
+	int frames = 0;
+	while(sim.velocity && frames < maxFrames)
+	{
+		double turn = 0.;
+		if(flip)
+		{
+			double delta = DeltaTo(sim.angle, -sim.velocity);
+			turn = TurnToward(true, delta, sim.angularVelocity, sim.ratedTurn, sim.angularAccel,
+				std::fabs(delta) < ALIGNED_DEGREES);
+		}
+		sim.Step(Stop(), turn);
+		++frames;
+	}
+	return frames;
+}
 
 // #endregion mock data
 
@@ -362,18 +416,27 @@ SCENARIO( "Flip and burn", "[NewtonianFlight][flip]" ) {
 	GIVEN( "a fast ship with weak retro thrust" ) {
 		const Point velocity = Unit(0.) * 20.;
 		THEN( "flipping is faster than braking on the retro thrusters" ) {
-			CHECK( ShouldFlipAndBurn(velocity, Unit(0.), FORWARD, BASELINE, RATED_TURN, 10.) );
-			CHECK( ShouldFlipAndBurn(velocity, Unit(90.), FORWARD, BASELINE, RATED_TURN, 10.) );
+			CHECK( ShouldFlipAndBurn(velocity, Unit(0.), 0., ShipBraking()) );
+			CHECK( ShouldFlipAndBurn(velocity, Unit(90.), 0., ShipBraking()) );
 		}
 		THEN( "it isn't when the retro thrusters are as strong as the main engine" ) {
-			CHECK_FALSE( ShouldFlipAndBurn(velocity, Unit(0.), FORWARD, FORWARD, RATED_TURN, 10.) );
+			Braking braking = ShipBraking();
+			braking.retro = FORWARD;
+			CHECK_FALSE( ShouldFlipAndBurn(velocity, Unit(0.), 0., braking) );
+		}
+		THEN( "it isn't when the drift is sideways and the lateral thrusters are strong" ) {
+			CHECK_FALSE( ShouldFlipAndBurn(velocity, Unit(90.), 0., ShipBraking(FORWARD * 2.)) );
 		}
 		THEN( "it isn't when one frame of main thrust would stop the ship anyway" ) {
-			CHECK_FALSE( ShouldFlipAndBurn(Unit(0.) * FORWARD, Unit(0.), FORWARD, BASELINE, RATED_TURN, 10.) );
+			CHECK_FALSE( ShouldFlipAndBurn(Unit(0.) * FORWARD, Unit(0.), 0., ShipBraking()) );
 		}
 		THEN( "it isn't when the ship can't turn or has no main engine" ) {
-			CHECK_FALSE( ShouldFlipAndBurn(velocity, Unit(0.), FORWARD, BASELINE, 0., 10.) );
-			CHECK_FALSE( ShouldFlipAndBurn(velocity, Unit(0.), 0., BASELINE, RATED_TURN, 10.) );
+			Braking braking = ShipBraking();
+			braking.ratedTurn = 0.;
+			CHECK_FALSE( ShouldFlipAndBurn(velocity, Unit(0.), 0., braking) );
+			braking = ShipBraking();
+			braking.main = 0.;
+			CHECK_FALSE( ShouldFlipAndBurn(velocity, Unit(0.), 0., braking) );
 		}
 	}
 	GIVEN( "a fast ship pressing STOP with assist on" ) {
@@ -381,19 +444,11 @@ SCENARIO( "Flip and burn", "[NewtonianFlight][flip]" ) {
 		{
 			Sim sim;
 			sim.velocity = Unit(0.) * 20.;
-			for(int i = 1; i <= 2000; ++i)
-			{
-				double turn = 0.;
-				if(flip && ShouldFlipAndBurn(sim.velocity, Unit(sim.angle), FORWARD, BASELINE, RATED_TURN, 10.))
-				{
-					double delta = DeltaTo(sim.angle, -sim.velocity);
-					turn = TurnToward(true, delta, sim.angularVelocity, RATED_TURN, ANGULAR_ACCEL, std::fabs(delta) < 1.);
-				}
-				sim.Step(Stop(), turn);
-				if(!sim.velocity)
-					return i;
-			}
-			return 0;
+			// Without a turn rate, the ship can only keep its facing.
+			if(!flip)
+				sim.ratedTurn = 0.;
+			int frames = FlyStop(sim, 2000);
+			return sim.velocity ? 0 : frames;
 		};
 		int flipFrames = framesToStop(true);
 		int retroFrames = framesToStop(false);
@@ -403,6 +458,221 @@ SCENARIO( "Flip and burn", "[NewtonianFlight][flip]" ) {
 		}
 		THEN( "flipping and burning stops it much sooner" ) {
 			CHECK( flipFrames < retroFrames / 2 );
+		}
+	}
+}
+
+SCENARIO( "Predicting a stop that keeps the facing", "[NewtonianFlight][predict]" ) {
+	// Fly STOP without turning and compare with the prediction, frame for frame.
+	auto check = [](const Point &velocity, double facingDegrees, const Braking &braking)
+	{
+		Sim sim;
+		sim.angle = facingDegrees;
+		sim.velocity = velocity;
+		sim.thrusters.forward = braking.main;
+		sim.thrusters.retro = braking.retro;
+		sim.thrusters.lateral = braking.lateral;
+		StopPrediction prediction = PredictStopKeepingFacing(velocity, Unit(facingDegrees), 0., braking);
+		REQUIRE( prediction.canStop );
+		CHECK_FALSE( prediction.flip );
+		int frames = 0;
+		while(sim.velocity && frames < 5000)
+		{
+			sim.Step(Stop());
+			++frames;
+		}
+		CHECK( frames == prediction.frames );
+		CHECK_THAT( sim.position.X(), WithinAbs(prediction.displacement.X(), 1e-6) );
+		CHECK_THAT( sim.position.Y(), WithinAbs(prediction.displacement.Y(), 1e-6) );
+		return prediction;
+	};
+	for(double direction : {0., 30., 90., 135., 180., -60.})
+		for(double lateral : {BASELINE, BASELINE * 2.})
+		{
+			DYNAMIC_SECTION( "moving at " << direction << " degrees, lateral thrust " << lateral ) {
+				check(Unit(direction) * RATED_SPEED, 0., ShipBraking(lateral));
+			}
+		}
+	GIVEN( "lateral thrust stronger than retro and an oblique drift" ) {
+		const Point velocity = Unit(45.) * RATED_SPEED;
+		StopPrediction prediction = check(velocity, 0., ShipBraking(BASELINE * 2.));
+		THEN( "the ship stops off its velocity line, on the side the weaker thrusters brake" ) {
+			double offLine = prediction.displacement.Cross(velocity.Unit());
+			CHECK( std::fabs(offLine) > 1. );
+			// The sideways part is braked first, so the stop point leans forward of the line.
+			CHECK( prediction.displacement.Dot(Unit(0.)) > prediction.displacement.Dot(Unit(90.)) );
+		}
+	}
+	GIVEN( "a ship moving straight backwards" ) {
+		StopPrediction prediction = check(Unit(180.) * RATED_SPEED, 0., ShipBraking());
+		THEN( "it brakes on the main engine" ) {
+			CHECK( prediction.frames == std::ceil(RATED_SPEED / FORWARD) );
+		}
+	}
+	GIVEN( "a ship drifting sideways with no lateral thrust" ) {
+		THEN( "it can't stop without turning" ) {
+			CHECK_FALSE( PredictStopKeepingFacing(Unit(90.) * 3., Unit(0.), 0., ShipBraking(0.)).canStop );
+			StopPrediction stop = PredictStop(Unit(90.) * 3., Unit(0.), 0., ShipBraking(0.));
+			CHECK( stop.canStop );
+			CHECK( stop.flip );
+		}
+	}
+	GIVEN( "a ship at rest" ) {
+		StopPrediction stop = PredictStop(Point(), Unit(0.), 0., ShipBraking());
+		THEN( "it is already stopped" ) {
+			CHECK( stop.canStop );
+			CHECK_FALSE( stop.flip );
+			CHECK( stop.frames == 0. );
+			CHECK( !stop.displacement );
+		}
+	}
+}
+
+SCENARIO( "Predicting a flip-and-burn stop", "[NewtonianFlight][predict]" ) {
+	for(double facing : {0., 60., 120.})
+	{
+		DYNAMIC_SECTION( "facing " << facing << " degrees from the motion" ) {
+			const Point velocity = Unit(0.) * 20.;
+			StopPrediction prediction = PredictStop(velocity, Unit(facing), 0., ShipBraking());
+			REQUIRE( prediction.flip );
+			Sim sim;
+			sim.angle = facing;
+			sim.velocity = velocity;
+			int frames = FlyStop(sim);
+			THEN( "the prediction matches the flown stop to within 1%" ) {
+				INFO( "flown " << frames << " frames, " << sim.position.Length() << " px; predicted "
+					<< prediction.frames << " frames, " << prediction.displacement.Length() << " px" );
+				CHECK_THAT( frames, WithinRel(prediction.frames, .01) );
+				CHECK_THAT( sim.position.Length(), WithinRel(prediction.displacement.Length(), .01) );
+			}
+			THEN( "it predicts where the ship comes to rest, off its original line" ) {
+				CHECK( sim.position.Unit().Dot(prediction.displacement.Unit()) > .999 );
+			}
+		}
+	}
+}
+
+SCENARIO( "Predicting STOP for slow-turning ships", "[NewtonianFlight][predict]" ) {
+	// Heavy ships turn slowly and take a long time to spin up. The flip and the
+	// held facing then often come out close, and both change as the ship turns,
+	// which is why STOP decides once and flies that stop through.
+	for(double ratedTurn : {.5, 1., 3.})
+		for(double spinUp : {10., 30., 60.})
+			for(double facing : {0., 45., 90., 135.})
+			{
+				DYNAMIC_SECTION( "turning " << ratedTurn << " deg/frame, spin-up " << spinUp
+						<< " frames, facing " << facing << " degrees from the motion" ) {
+					Sim sim;
+					sim.ratedTurn = ratedTurn;
+					sim.angularAccel = ratedTurn / spinUp;
+					sim.angle = facing;
+					sim.velocity = Unit(0.) * 10.;
+					StopPrediction prediction = PredictStop(sim.velocity, Unit(facing), 0., SimBraking(sim));
+					REQUIRE( prediction.canStop );
+					int frames = FlyStop(sim);
+					THEN( "the prediction made when STOP begins matches the flown stop" ) {
+						INFO( "flown " << frames << " frames, predicted " << prediction.frames
+							<< (prediction.flip ? " (flip)" : " (keep facing)") );
+						CHECK( !sim.velocity );
+						CHECK( std::fabs(frames - prediction.frames) <= prediction.frames * .02 + 1. );
+						CHECK( sim.position.Distance(prediction.displacement) <= prediction.displacement.Length() * .02 + 1. );
+					}
+				}
+			}
+}
+
+SCENARIO( "Predicting STOP for a ship that is already spinning", "[NewtonianFlight][predict]" ) {
+	GIVEN( "a slow-turning ship spinning when it keeps its facing" ) {
+		// Assist brakes the spin, and the facing swings round while it does.
+		for(double spin : {-1.5, 1.5})
+		{
+			DYNAMIC_SECTION( "spinning " << spin << " deg/frame" ) {
+				Sim sim;
+				sim.ratedTurn = 1.5;
+				sim.angularAccel = 1.5 / 30.;
+				sim.angularVelocity = spin;
+				sim.velocity = Unit(30.) * RATED_SPEED;
+				sim.thrusters.lateral = BASELINE * 2.;
+				StopPrediction prediction = PredictStopKeepingFacing(sim.velocity, Unit(0.), spin, SimBraking(sim));
+				StopPrediction still = PredictStopKeepingFacing(sim.velocity, Unit(0.), 0., SimBraking(sim));
+				int frames = 0;
+				while(sim.velocity && frames < 5000)
+				{
+					sim.Step(Stop());
+					++frames;
+				}
+				THEN( "the prediction follows the swing, frame for frame" ) {
+					CHECK( frames == prediction.frames );
+					CHECK_THAT( sim.position.X(), WithinAbs(prediction.displacement.X(), 1e-6) );
+					CHECK_THAT( sim.position.Y(), WithinAbs(prediction.displacement.Y(), 1e-6) );
+				}
+				THEN( "it differs from assuming the facing holds still" ) {
+					CHECK( prediction.displacement.Distance(still.displacement) > 1. );
+				}
+			}
+		}
+	}
+	GIVEN( "a ship already turning to flip" ) {
+		const Point velocity = Unit(0.) * 20.;
+		const Braking braking = ShipBraking();
+		const double fromRest = PredictFlipAndBurn(velocity, Unit(90.), 0., braking).frames;
+		THEN( "spinning toward retrograde makes the flip sooner, and away makes it later" ) {
+			CHECK( PredictFlipAndBurn(velocity, Unit(90.), RATED_TURN, braking).frames < fromRest );
+			CHECK( PredictFlipAndBurn(velocity, Unit(90.), -RATED_TURN, braking).frames > fromRest );
+		}
+		THEN( "a ship pressing STOP mid-turn is predicted from its current spin" ) {
+			Sim sim;
+			sim.angle = 90.;
+			sim.angularVelocity = RATED_TURN;
+			sim.velocity = velocity;
+			StopPrediction prediction = PredictStop(sim.velocity, Unit(90.), RATED_TURN, braking);
+			REQUIRE( prediction.flip );
+			int frames = FlyStop(sim);
+			CHECK( std::fabs(frames - prediction.frames) <= prediction.frames * .02 + 1. );
+		}
+	}
+	GIVEN( "a ship with no lateral thrust drifting slowly sideways" ) {
+		// Slower than one frame of main thrust, but only a flip can stop it.
+		StopPrediction stop = PredictStop(Unit(90.) * (FORWARD * .5), Unit(0.), 0., ShipBraking(0.));
+		THEN( "it flips rather than reporting it can't stop" ) {
+			CHECK( stop.canStop );
+			CHECK( stop.flip );
+		}
+	}
+}
+
+SCENARIO( "Relative motion", "[NewtonianFlight][relative]" ) {
+	GIVEN( "a target ahead" ) {
+		const Point position(0., -1000.);
+		THEN( "closing speed is positive when approaching and negative when opening" ) {
+			CHECK_THAT( ClosingSpeed(position, Point(0., 5.)), WithinAbs(5., 1e-12) );
+			CHECK_THAT( ClosingSpeed(position, Point(0., -5.)), WithinAbs(-5., 1e-12) );
+			CHECK_THAT( ClosingSpeed(position, Point(5., 0.)), WithinAbs(0., 1e-12) );
+		}
+		THEN( "a target coming straight at us passes at zero distance" ) {
+			Approach approach = ClosestApproach(position, Point(0., 5.));
+			CHECK_THAT( approach.frames, WithinAbs(200., 1e-9) );
+			CHECK_THAT( approach.distance, WithinAbs(0., 1e-9) );
+		}
+		THEN( "a target crossing our path passes at its offset" ) {
+			Approach approach = ClosestApproach(Point(-300., -400.), Point(5., 0.));
+			CHECK_THAT( approach.frames, WithinAbs(60., 1e-9) );
+			CHECK_THAT( approach.distance, WithinAbs(400., 1e-9) );
+		}
+		THEN( "a target moving away is closest now" ) {
+			Approach approach = ClosestApproach(position, Point(1., -5.));
+			CHECK( approach.frames == 0. );
+			CHECK_THAT( approach.distance, WithinAbs(1000., 1e-9) );
+		}
+		THEN( "a target matching our velocity stays where it is" ) {
+			Approach approach = ClosestApproach(position, Point());
+			CHECK( approach.frames == 0. );
+			CHECK_THAT( approach.distance, WithinAbs(1000., 1e-9) );
+		}
+	}
+	GIVEN( "a target at our position" ) {
+		THEN( "there is no closing speed" ) {
+			CHECK( ClosingSpeed(Point(), Point(3., 4.)) == 0. );
 		}
 	}
 }

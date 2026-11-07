@@ -91,8 +91,68 @@ namespace NewtonianFlight {
 	double TurnToward(bool assist, double delta, double angularVelocity, double ratedTurn,
 		double angularAccel, bool close);
 
-	// Whether turning to face retrograde and braking on the main engine stops the ship
-	// sooner than braking on its retro thrusters while keeping its facing.
-	bool ShouldFlipAndBurn(const Point &velocity, const Point &facing, double mainAccel,
-		double retroAccel, double ratedTurn, double spinUpFrames);
+	// Flight prediction (A6 step 2). The HUD and the AI both use these, so the cues
+	// the player sees and the way the AI flies never disagree. Times are in frames
+	// and distances in pixels; velocities are per frame. To predict motion relative
+	// to a target, pass the velocity relative to it.
+
+	// What a ship can brake with: delta-v per frame for each thruster group (the
+	// afterburner never brakes), and how fast it can turn.
+	struct Braking {
+		double main = 0.;
+		double retro = 0.;
+		double lateral = 0.;
+		// Degrees per frame.
+		double ratedTurn = 0.;
+		// Frames to spin up to the rated turn rate.
+		double spinUpFrames = 0.;
+	};
+
+	// Where and when a ship would come to rest if the flight computer's STOP took
+	// over now. With assist off, it's the best stop flying by hand could manage.
+	struct StopPrediction {
+		// False if some part of the velocity can't be braked at all.
+		bool canStop = true;
+		// True if the stop turns to face retrograde and brakes on the main engine.
+		bool flip = false;
+		// Frames until the ship is at rest.
+		double frames = 0.;
+		// Where the ship comes to rest, relative to where it is now. Each thruster
+		// group brakes its own axis, so this is generally not along the velocity.
+		Point displacement;
+	};
+
+	// STOP keeping the current facing: retro (or the main engine, if moving
+	// backwards) brakes along the facing, and lateral thrust brakes across it,
+	// frame by frame exactly as PlanTranslation does. If the ship is spinning
+	// (degrees per frame), the facing swings round while the spin is braked.
+	StopPrediction PredictStopKeepingFacing(const Point &velocity, const Point &facing, double angularVelocity,
+		const Braking &braking);
+	// STOP by turning to face retrograde, then braking on the main engine. The turn
+	// is stepped through frame by frame (it's short), braking as it goes, starting
+	// from the ship's current spin (degrees per frame), and the burn uses the exact
+	// formula.
+	StopPrediction PredictFlipAndBurn(const Point &velocity, const Point &facing, double angularVelocity,
+		const Braking &braking);
+	// Whichever of the two stops the ship sooner. STOP decides this once, when it
+	// begins, and then flies that stop through: re-deciding every frame dithers,
+	// because the two are often close and both change as the ship turns.
+	StopPrediction PredictStop(const Point &velocity, const Point &facing, double angularVelocity,
+		const Braking &braking);
+	// Whether a STOP beginning now should flip and burn rather than keep its facing.
+	bool ShouldFlipAndBurn(const Point &velocity, const Point &facing, double angularVelocity, const Braking &braking);
+
+	// How fast two objects are closing on each other: positive closing, negative
+	// opening. The arguments are the other object's position and velocity minus
+	// one's own.
+	double ClosingSpeed(const Point &relativePosition, const Point &relativeVelocity);
+
+	// When and how near two objects pass each other, if neither changes velocity.
+	struct Approach {
+		// Frames from now; zero if they're already moving apart.
+		double frames = 0.;
+		// Their separation at that moment.
+		double distance = 0.;
+	};
+	Approach ClosestApproach(const Point &relativePosition, const Point &relativeVelocity);
 }

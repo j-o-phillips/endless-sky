@@ -3946,9 +3946,19 @@ double Ship::SpinUpFrames() const
 
 
 
-double Ship::NewtonianRetroAcceleration() const
+NewtonianFlight::Braking Ship::NewtonianBraking() const
 {
-	return ReverseAcceleration() + Acceleration() * GetNewtonianTuning().baseline;
+	// The same thruster groups DoNewtonianMovement fires, slowed the same way.
+	const double slowMultiplier = 1. / (1. + levels.slowness * .05);
+	const double baseline = Acceleration() * GetNewtonianTuning().baseline;
+	const double lateralOutfits = cache.lateralThrust / InertialMass() * cache.accelerationMult;
+	NewtonianFlight::Braking braking;
+	braking.main = Acceleration() * slowMultiplier;
+	braking.retro = (baseline + ReverseAcceleration()) * slowMultiplier;
+	braking.lateral = (baseline + lateralOutfits) * slowMultiplier;
+	braking.ratedTurn = TrueTurnRate();
+	braking.spinUpFrames = SpinUpFrames();
+	return braking;
 }
 
 
